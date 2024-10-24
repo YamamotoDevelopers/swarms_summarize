@@ -3,6 +3,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 import glob
 from typing import List, Dict
+import asyncio
+from lightrag import LightRAG, QueryParam
+from lightrag.llm import openai_complete_if_cache, openai_embedding
+from lightrag.utils import EmbeddingFunc
+import numpy as np
+import logging
+from swarm_models import OpenAIChat
 
 # Set up workspace directory
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +20,9 @@ from swarm_models import OpenAIChat
 from swarms.structs.swarm_router import SwarmRouter
 from swarms_memory import ChromaDB
 import subprocess
+
+# Add to existing imports
+from concurrent_workflow_async import AsyncConcurrentWorkflow
 
 load_dotenv()
 
@@ -49,13 +59,129 @@ def load_text_documents(docs_folder: str) -> List[Dict[str, str]]:
     
     return documents
 
+# Add LightRAG configuration
+async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str:
+    return await openai_complete_if_cache(
+        "Meta-Llama-3.1-70B-Instruct",
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        api_key=api_key,
+        base_url="https://api.sambanova.ai/v1",
+        **kwargs,
+    )
+
+async def embedding_func(texts: list[str]) -> np.ndarray:
+    return await openai_embedding(
+        texts,
+        model="nomic-embed-text:latest",
+        api_key=api_key,
+        base_url="https://api.sambanova.ai/v1",
+    )
+
+async def initialize_lightrag():
+    try:
+        workspace_dir = os.path.join(WORKSPACE_DIR, "lightrag_workspace")
+        os.makedirs(workspace_dir, exist_ok=True)
+        
+        print(f"Initializing LightRAG with workspace: {workspace_dir}")
+        
+        # Test embedding to get dimension
+        test_text = ["This is a test sentence."]
+        embedding = await embedding_func(test_text)
+        embedding_dimension = embedding.shape[1]
+        print(f"Embedding dimension: {embedding_dimension}")
+        
+        rag = LightRAG(
+            working_dir=workspace_dir,
+            llm_model_func=llm_model_func,
+            embedding_func=EmbeddingFunc(
+                embedding_dim=embedding_dimension,
+                max_token_size=8192,
+                func=embedding_func
+            ),
+        )
+        print("LightRAG initialized successfully")
+        return rag
+    except Exception as e:
+        print(f"Error initializing LightRAG: {e}")
+        return None
+
+# Modify document loading to use both ChromaDB and LightRAG
+async def load_and_process_documents(docs_folder: str):
+    documents = load_text_documents(docs_folder)
+    
+    # Initialize LightRAG
+    rag = await initialize_lightrag()
+    
+    if documents and rag:
+        # Process documents sequentially to avoid event loop conflicts
+        for doc in documents:
+            try:
+                # Add to ChromaDB for agent memory
+                memory.add(document=doc["content"])
+                
+                # Add to LightRAG directly
+                await rag.insert(doc["content"])
+                print(f"Document {doc['id']} processed successfully with LightRAG")
+            except Exception as e:
+                print(f"Error processing document {doc['id']}: {str(e)}")
+    
+    return rag
+
+# Modify the DOCUMENT_RETRIEVER_PROMPT
+DOCUMENT_RETRIEVER_PROMPT = """You are a highly specialized document retrieval agent that uses both ChromaDB and LightRAG. Your tasks include:
+1. Using LightRAG for advanced document retrieval with multiple search modes (naive, local, global, hybrid)
+2. Falling back to ChromaDB when needed for historical context and agent memory
+3. Combining results from both systems for comprehensive information retrieval
+4. Implementing advanced RAG techniques for accurate retrieval
+5. Providing specific quotes and references from the source documents
+Provide a list of relevant documents along with their relevance scores and specific content matches."""
+
+# Update document retriever agent to include LightRAG
+class EnhancedDocumentRetrieverAgent(Agent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rag = None
+    
+    async def set_rag(self, rag):
+        self.rag = rag
+        
+    async def get_relevant_documents(self, query: str):
+        results = []
+        
+        # Get results from LightRAG using different modes
+        if self.rag:
+            try:
+                for mode in ["naive", "local", "global", "hybrid"]:
+                    rag_result = await self.rag.query(
+                        query, 
+                        param=QueryParam(mode=mode)
+                    )
+                    results.append({"source": f"LightRAG ({mode})", "content": rag_result})
+            except Exception as e:
+                print(f"LightRAG query error: {e}")
+        
+        # Get results from ChromaDB - using query instead of search
+        try:
+            chroma_results = self.long_term_memory.query(query)
+            # Combine characters into complete strings
+            if isinstance(chroma_results, list):
+                complete_text = ''.join(r if isinstance(r, str) else r.get('content', '') 
+                                    for r in chroma_results)
+                results.append({"source": "ChromaDB", "content": complete_text})
+        except Exception as e:
+            print(f"ChromaDB query error: {e}")
+        
+        return results
+
 # Initialize ChromaDB with document loading
-docs = load_text_documents("docs")
+docs = load_text_documents("memory")
 memory = ChromaDB(
     metric="cosine",
     n_results=5,
     output_dir="results",
-    docs_folder="docs",
+    docs_folder="memory",
     verbose=True
 )
 
@@ -71,21 +197,13 @@ if docs:
 
 # Initialize the language model
 model = OpenAIChat(
-    openai_api_base="http://localhost:11434/v1",
+    openai_api_base="https://api.sambanova.ai/v1",
     openai_api_key=api_key,
-    model_name="hf.co/arcee-ai/SuperNova-Medius-GGUF:f16",
+    model_name="Meta-Llama-3.1-70B-Instruct",
     temperature=0.1,
 )
 
 # Define specialized system prompts for each agent
-DOCUMENT_RETRIEVER_PROMPT = """You are a highly specialized document retrieval agent. Your tasks include:
-1. Analyzing user queries to understand the information needs
-2. Retrieving relevant documents from the repository based on the query
-3. Accessing and searching through the available text documents in the docs folder
-4. Implementing advanced Retrieval-Augmented Generation (RAG) techniques for accurate retrieval
-5. Providing specific quotes and references from the source documents
-Provide a list of relevant documents along with their relevance scores and specific content matches."""
-
 SUMMARIZER_PROMPT = """You are an expert summarization agent. Your core competencies include:
 1. Extracting key insights from complex documents
 2. Summarizing information into concise, numbered bullet points
@@ -122,7 +240,7 @@ QUALITY_CHECKER_PROMPT = """You are a specialized quality and accuracy checking 
 Deliver a comprehensive quality report, including accuracy scores and any identified issues."""
 
 # Initialize specialized agents
-document_retriever_agent = Agent(
+document_retriever_agent = EnhancedDocumentRetrieverAgent(
     agent_name="Document-Retriever",
     system_prompt=DOCUMENT_RETRIEVER_PROMPT,
     llm=model,
@@ -213,38 +331,149 @@ quality_checker_agent = Agent(
     output_type="string"
 )
 
-# Initialize the SwarmRouter
-print("Initializing SwarmRouter with agents:")
+# Initialize the base agent list
+print("Initializing agent list:")
 agent_list = [
+    contextual_relevance_agent,
     document_retriever_agent,
     summarizer_agent,
     citation_tracer_agent,
-    contextual_relevance_agent,
-    output_formatter_agent,
-    quality_checker_agent
+    quality_checker_agent,
+    output_formatter_agent
 ]
 print(f"Number of agents: {len(agent_list)}")
 for agent in agent_list:
     print(f"- {agent.agent_name}")
 
-router = SwarmRouter(
-    name="summarize-ai-swarm",
-    description="Analyze and summarize documents based on user queries",
-    max_loops=1,
-    agents=agent_list,
-    swarm_type="ConcurrentWorkflow"
-)
+# Modify the router run method to handle async operations
+class AsyncSwarmRouter(SwarmRouter):
+    def __init__(self, name, description, max_loops, agents, swarm_type):
+        # Call parent class initialization first
+        super().__init__(
+            name=name,
+            description=description,
+            max_loops=max_loops,
+            agents=agents,
+            swarm_type=swarm_type
+        )
+        
+        self.logs = []  # Add this line to store logs
+        
+        # Initialize base attributes
+        self.name = name
+        self.description = description
+        self.max_loops = max_loops
+        self.agents = agents.copy()
+        self.swarm_type = swarm_type
+        
+        # Setup logging with custom handler to capture logs
+        self.logger = logging.getLogger(self.name)
+        self.logger.setLevel(logging.INFO)
+        
+        class LogCaptureHandler(logging.Handler):
+            def __init__(self, log_list):
+                super().__init__()
+                self.log_list = log_list
+            
+            def emit(self, record):
+                log_entry = {
+                    'timestamp': record.asctime if hasattr(record, 'asctime') else record.created,
+                    'level': record.levelname,
+                    'message': record.getMessage()
+                }
+                self.log_list.append(log_entry)
+        
+        # Add our custom handler
+        if not self.logger.handlers:
+            handler = LogCaptureHandler(self.logs)
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            
+            # Also add console handler
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
+        
+        if not self.agents or len(self.agents) == 0:
+            raise ValueError("Agents list must not be empty")
+            
+        self.logger.info(f"Initializing AsyncSwarmRouter with {len(self.agents)} agents")
+        if self.swarm_type == "ConcurrentWorkflow":
+            # Pass a copy of the agents list to AsyncConcurrentWorkflow
+            self.swarm = AsyncConcurrentWorkflow(agents=self.agents.copy())
+            self.logger.info(f"Initialized AsyncConcurrentWorkflow with {len(self.agents)} agents")
 
-# Add debug output
-print(f"Initializing SwarmRouter with {len(router.agents)} agents")
+    def get_logs(self):
+        """Return the captured logs"""
+        return self.logs
 
-if __name__ == "__main__":
-    # Run a comprehensive private equity document analysis task
-    result = router.run(
-        "how could mycelium evlove the ability to traverse the stars organically?"
+    async def async_run(self, task, *args, **kwargs):
+        if not self.agents or len(self.agents) == 0:
+            raise ValueError("No agents available for processing")
+        try:
+            self.logger.info(f"Running task with {len(self.agents)} agents")
+            if self.swarm_type == "ConcurrentWorkflow":
+                result = await self.swarm.async_process_agents(task, *args, **kwargs)
+                return result
+        except Exception as e:
+            self.logger.error(f"Error occurred while running task: {str(e)}")
+            raise e
+
+# Move these functions outside the if __name__ == "__main__": block
+async def initialize_system():
+    # Initialize LightRAG and process documents
+    rag = await load_and_process_documents("docs")
+    
+    # Set RAG for the existing document retriever agent
+    await document_retriever_agent.set_rag(rag)
+    
+    # Verify agent list before router initialization
+    if not agent_list or len(agent_list) == 0:
+        raise ValueError("Agent list is empty before router initialization")
+        
+    # Initialize router with existing agent list
+    router = AsyncSwarmRouter(
+        name="summarize-ai-swarm",
+        description="Analyze and summarize documents based on user queries",
+        max_loops=1,
+        agents=agent_list.copy(),  # Pass a copy of the agent list
+        swarm_type="ConcurrentWorkflow"
     )
-    print(result)
+    
+    return router
 
-    # Retrieve and print logs
-    for log in router.get_logs():
-        print(f"{log.timestamp} - {log.level}: {log.message}")
+async def run_query(router, query):
+    try:
+        result = await router.async_run(query)
+        print(result)
+        
+        for log in router.get_logs():
+            print(f"{log.timestamp} - {log.level}: {log.message}")
+            
+        return result
+    except Exception as e:
+        print(f"Error running query: {e}")
+        return None
+
+# Keep the main block for direct script execution
+if __name__ == "__main__":
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s: %(message)s'
+    )
+    
+    async def main():
+        try:
+            router = await initialize_system()
+            await run_query(
+                router,
+                "how could mycelium evolve the ability to harness the sun's power like a Dyson Sphere?"
+            )
+        except Exception as e:
+            print(f"Error in main execution: {e}")
+            raise e
+
+    # Run with proper asyncio handling
+    asyncio.run(main())
