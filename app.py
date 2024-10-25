@@ -129,7 +129,7 @@ async def load_and_process_documents(docs_folder: str):
     
     return rag
 
-# Modify the DOCUMENT_RETRIEVER_PROMPT
+# DOCUMENT_RETRIEVER_PROMPT
 DOCUMENT_RETRIEVER_PROMPT = """You are a highly specialized document retrieval agent that uses both ChromaDB and LightRAG. Your tasks include:
 1. Using LightRAG for advanced document retrieval with multiple search modes (naive, local, global, hybrid)
 2. Falling back to ChromaDB when needed for historical context and agent memory
